@@ -1,1 +1,0 @@
-# adynatos.github.io
