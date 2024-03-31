@@ -24,7 +24,7 @@ Important things to note:
 
 ASLR (address space layout randomization) means that program sections such as heap, stack, etc load address would be randomized. It makes our job slightly harder, because we cannot rely on any hardcoded addresses.
 
-Challenge name together with glibc version used suggest that attack like tcache dup would be useful. Let's keep that in mind and explore what challenge bin gives us.
+Challenge name together with glibc version used suggest that attack like [tcache dup](https://guyinatuxedo.github.io/29-tcache/tcache_explanation/index.html) would be useful. Let's keep that in mind and explore what challenge bin gives us.
 After starting challenge binary we are greeted by this menu:
 {% highlight console %}
 ady@heap-lab:~/heaplab2/challenge-tcache_troll$ ./tcache_troll 
@@ -42,20 +42,22 @@ ady@heap-lab:~/heaplab2/challenge-tcache_troll$ ./tcache_troll
 Options are pretty self explanatory:
 Malloc uses glibc malloc to allocate up to 1024 bytes of memory and copy provided data into it. Address returned by malloc is saved and can be used by other functions (each alloc get next index starting from zero)
 Free deallocate selected chunk by idx.
-Read reads 8 bytes of memory by idx.
+Read reads 8 bytes of memory by idx (excluding freed chunks)
+To make things a bit harder, we are given limited amount of calls - 5 for free and 8 for malloc.
 
 Finding bug was fairly easy - program doesn't check for double free allowing us to free same memory multiple times. As mentioned before this allows us to use attack such as tcache dup to get arbitrary code execution. Because target was compiled with ASLR we need to leak libc address, so we could 'call' libc functions, such as system.
-My first idea was to somehow dup chunk linked into unsorted bin and read fwd pointer to main arena. That wasn't possible due to tcache and limited amount of calls to free. With only 5 calls we are unable to use all 7 tcache slots to free chunk into.
-
-After some pondering I remembered that tcache metadata, including number of allocated block for given size is kept on heap (in first 0x250 bytes sized chunk).
+My first idea was to somehow dup chunk linked into [unsorted bin](https://ir0nstone.gitbook.io/notes/types/heap/bins#unsorted-bin) and read it's pointer to main arena. That wasn't possible due to tcache and limited amount of calls to free. With only 5 calls we are unable to fill all tcache slots, to free chunk into unsorted_bin.
+(Main arena is libc symbol containing various heap metadata, including free chunks lists such as unsorted_bin. Since it's in libc segment, we can use it's address and offset inside libc to calculate other addresses)
+After quite some thinking I remembered that tcache metadata, including number of allocated block for given size is kept on heap (in first 0x250 bytes sized chunk).
 What if we overwrite size field so chosen slot will look like filled. Next deallocation should avoid tcache and be linked into other bin.
 
 So plan of attack looks like this:
 1. Leak heap address
 2. Overwrite tcache metadata to convince glibc that specific tcache slot is full, then free duplicated chunk into unsorted_bin, leaking libc address
 3. Use tcache dup to overwrite __free_hook with system then free chunk with `/bin/sh\0` to get shell
+Don't worry if you don't understand details of some steps, I'll try to briefly explain concepts as I go.
 
-Let's start with step 1:
+<h3>Let's start with step 1:</h3>
 First let's allocate and free two 0x20 sized chunk, then look into heap with gdb:
 {% highlight bash %}
 pwndbg> vis
@@ -105,11 +107,9 @@ pwndbg> vis
 {% endhighlight %}
 
 We see chunk containing tcache at top of heap at address 0x563bcc836000. Next are bins sizes, one byte per bin.
-At 0x563bcc836000 lies 0x20 sized bin - it contains ptr to first free chunk in that bin, which in turn points to next free chunk,
-forming linked list of free chunks.
+At 0x563bcc836000 lies bin for 0x20 sized chunks - it contains address of first free chunk in that bin. Part of that chunk is then reused to contain ptr to next free chunk (we can see that at 0x563bcc836280)
 
-If we free same chunk twice and then allocate new one with same size it will be allocated from tcache, but still considered part of tcache fwd list.
-After freeing it again, libc will link it into list, writing fwd ptr to itself into it's user data.
+If we free same chunk twice and then allocate new one with same size it will be allocated from tcache, but still considered part of tcache list. Because of that freeing it again will cause libc to link it again into tcache, writing ptr to it into last chunk (which is itself)
 Because it's duplicated and we freed only one end, we can use other to read it, leaking heap address :)
 
 Following pwntools scripts shows that:
@@ -121,7 +121,7 @@ free(dup)
 leak = malloc(0x18, b"B"*8)
 free(dup)
 
-heap = u64(read(leak)) - 0x260 # 0x10 bytes of chunk header + 0x250 byets of tcache chunk
+heap = u64(read(leak)) - 0x260 # 0x10 bytes of chunk header + 0x250 bytes of tcache chunk
 log.info(f"heap addr - 0x{heap:x}")
 {% endhighlight %}
 
@@ -142,10 +142,10 @@ LEGEND: STACK | HEAP | CODE | DATA | RWX | RODATA
     0x7fb97920b000     0x7fb9793b7000 r-xp   1ac000      0 /home/ady/heaplab2/.glibc/glibc_2.28/libc-2.28.so
 {% endhighlight %}
 
-Step 2:
+<h3>Step 2:</h3>
 We can keep using our duplicated chunk to perform tcache dup attack - we allocate new chunk and set it data to target we want to overwrite.
-Next allocation will unlink our chunk from tcache list, treating our data as fwd ptr and writing it to head of bin.
-Succeeding allocation will be served from that bin, giving us chunk starting at target data - we can use it to set size field of 0x90 bin to 7 (which means that bin is full)
+Next allocation will unlink our chunk from tcache list, treating our data as ptr to next chunk and writing it to head of bin.
+Succeeding allocation will be served from that bin, giving us chunk starting at target data - we can use it to set size field of 0x90 bin to MAX_TCACHE_BIN_SIZEa(which is 7)
 After that we just need to free chunk and it will avoid tcache and be linked into unsorted bin - it's first qword will contain address of bin in main_arena. We can use it to calculate libc address.
 
 Also we had to add guard chunk before dup chunk, to avoid consolidation with top chunk and change chunk sizes to 0x90, so it will be freed into unsorted bin instead of fastbin.
@@ -179,7 +179,7 @@ Step 3:
 At this point it should be easy to wrap things up - just use tcache dup again to overwrite libc._free_hook.
 Unfortunately at this point we have one call to free and two to malloc - not enough for this attack.
 
-Instead we could use our write to tcache metadata. We can write fake ptr into bin, and allocate from it, getting chunk overlapping address we want to write to.
+Instead we could use our write to tcache metadata. We can write fake ptr into bin, and then allocate from that bin, getting chunk at address we want to write into.
 The only problem is that we don't have libc address at that time, but we can setup another overwrite into other tcache bin (let's say 0x20) and then allocate from it after getting libc address.
 Rest is fairly simple - we can use that write address of libc.system into libc.__free_hook. Next call free on chunk with "/bin/sh\0" data gets us shell.
 
